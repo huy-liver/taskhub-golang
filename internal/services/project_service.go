@@ -2,11 +2,14 @@ package services
 
 import (
 	"context"
+	"fmt"
+	"taskhub/internal/cache"
 	"taskhub/internal/dto"
 	"taskhub/internal/errors"
 	"taskhub/internal/models"
 	"taskhub/internal/repositories"
 	"taskhub/internal/utils"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -22,11 +25,21 @@ type ProjectService interface {
 
 type projectService struct {
 	projectRepo repositories.ProjectRepository
+	cache       *cache.RedisClient
+	cacheTTL    time.Duration
 }
 
-// NewProjectService creates a new ProjectService instance
-func NewProjectService(projectRepo repositories.ProjectRepository) ProjectService {
-	return &projectService{projectRepo: projectRepo}
+// NewProjectService creates a new ProjectService instance with optional Redis cache
+func NewProjectService(projectRepo repositories.ProjectRepository, cacheClient ...*cache.RedisClient) ProjectService {
+	var c *cache.RedisClient
+	if len(cacheClient) > 0 && cacheClient[0] != nil {
+		c = cacheClient[0]
+	}
+	return &projectService{
+		projectRepo: projectRepo,
+		cache:       c,
+		cacheTTL:    15 * time.Minute,
+	}
 }
 
 func (s *projectService) Create(ctx context.Context, ownerID uint, req *dto.CreateProjectRequest) (*dto.ProjectResponse, *errors.AppError) {
@@ -40,6 +53,8 @@ func (s *projectService) Create(ctx context.Context, ownerID uint, req *dto.Crea
 		return nil, errors.NewInternalServerError("Failed to create project", err)
 	}
 
+	s.invalidateCache(ctx)
+
 	// Fetch with owner relation
 	created, err := s.projectRepo.GetByID(ctx, project.ID)
 	if err != nil {
@@ -50,6 +65,14 @@ func (s *projectService) Create(ctx context.Context, ownerID uint, req *dto.Crea
 }
 
 func (s *projectService) GetByID(ctx context.Context, id uint) (*dto.ProjectResponse, *errors.AppError) {
+	cacheKey := fmt.Sprintf("project:detail:%d", id)
+	if s.cache != nil {
+		var cached dto.ProjectResponse
+		if err := s.cache.Get(ctx, cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
+	}
+
 	project, err := s.projectRepo.GetByID(ctx, id)
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -59,7 +82,13 @@ func (s *projectService) GetByID(ctx context.Context, id uint) (*dto.ProjectResp
 	}
 
 	taskCount, _ := s.projectRepo.CountTasks(ctx, id)
-	return toProjectResponse(project, taskCount), nil
+	res := toProjectResponse(project, taskCount)
+
+	if s.cache != nil && res != nil {
+		_ = s.cache.Set(ctx, cacheKey, res, s.cacheTTL)
+	}
+
+	return res, nil
 }
 
 func (s *projectService) Update(ctx context.Context, id uint, userID uint, role string, req *dto.UpdateProjectRequest) (*dto.ProjectResponse, *errors.AppError) {
@@ -87,6 +116,8 @@ func (s *projectService) Update(ctx context.Context, id uint, userID uint, role 
 		return nil, errors.NewInternalServerError("Failed to update project", err)
 	}
 
+	s.invalidateCache(ctx)
+
 	taskCount, _ := s.projectRepo.CountTasks(ctx, id)
 	return toProjectResponse(project, taskCount), nil
 }
@@ -108,6 +139,8 @@ func (s *projectService) Delete(ctx context.Context, id uint, userID uint, role 
 	if err := s.projectRepo.Delete(ctx, id); err != nil {
 		return errors.NewInternalServerError("Failed to delete project", err)
 	}
+
+	s.invalidateCache(ctx)
 	return nil
 }
 
@@ -124,6 +157,12 @@ func (s *projectService) List(ctx context.Context, pagination utils.PaginationQu
 	}
 
 	return responses, total, nil
+}
+
+func (s *projectService) invalidateCache(ctx context.Context) {
+	if s.cache != nil {
+		_ = s.cache.DeleteByPattern(ctx, "project:*")
+	}
 }
 
 func toProjectResponse(p *models.Project, taskCount int) *dto.ProjectResponse {

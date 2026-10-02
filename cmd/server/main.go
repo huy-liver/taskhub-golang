@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"taskhub/internal/cache"
 	"taskhub/internal/configs"
 	"taskhub/internal/handlers"
 	"taskhub/internal/models"
@@ -54,20 +55,30 @@ func main() {
 		logger.Info("Database connection and migrations completed successfully")
 	}
 
-	// 4. Initialize Repositories
+	// 4. Initialize Redis Cache
+	redisClient, err := cache.InitRedis(cfg)
+	if err != nil {
+		logger.Warn("Failed to connect to Redis (continuing in degraded mode without cache)",
+			zap.Error(err),
+		)
+	} else {
+		logger.Info("Connected to Redis successfully")
+	}
+
+	// 5. Initialize Repositories
 	userRepo := repositories.NewUserRepository(db)
 	projectRepo := repositories.NewProjectRepository(db)
 	taskRepo := repositories.NewTaskRepository(db)
 	commentRepo := repositories.NewCommentRepository(db)
 
-	// 5. Initialize Services
+	// 6. Initialize Services
 	authService := services.NewAuthService(userRepo, cfg)
 	userService := services.NewUserService(userRepo)
-	projectService := services.NewProjectService(projectRepo)
-	taskService := services.NewTaskService(taskRepo, projectRepo, userRepo)
+	projectService := services.NewProjectService(projectRepo, redisClient)
+	taskService := services.NewTaskService(taskRepo, projectRepo, userRepo, redisClient)
 	commentService := services.NewCommentService(commentRepo, taskRepo)
 
-	// 6. Initialize Handlers
+	// 7. Initialize Handlers
 	h := &routes.Handlers{
 		AuthHandler:    handlers.NewAuthHandler(authService),
 		UserHandler:    handlers.NewUserHandler(userService),
@@ -76,8 +87,8 @@ func main() {
 		CommentHandler: handlers.NewCommentHandler(commentService),
 	}
 
-	// 7. Initialize Router
-	router := routes.SetupRouter(cfg, logger, h)
+	// 8. Initialize Router
+	router := routes.SetupRouter(cfg, logger, h, redisClient)
 
 	// 8. Start HTTP Server with Graceful Shutdown
 	srv := &http.Server{

@@ -2,11 +2,14 @@ package services
 
 import (
 	"context"
+	"fmt"
+	"taskhub/internal/cache"
 	"taskhub/internal/dto"
 	"taskhub/internal/errors"
 	"taskhub/internal/models"
 	"taskhub/internal/repositories"
 	"taskhub/internal/utils"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -25,14 +28,22 @@ type taskService struct {
 	taskRepo    repositories.TaskRepository
 	projectRepo repositories.ProjectRepository
 	userRepo    repositories.UserRepository
+	cache       *cache.RedisClient
+	cacheTTL    time.Duration
 }
 
-// NewTaskService creates a new TaskService instance
-func NewTaskService(taskRepo repositories.TaskRepository, projectRepo repositories.ProjectRepository, userRepo repositories.UserRepository) TaskService {
+// NewTaskService creates a new TaskService instance with optional Redis cache
+func NewTaskService(taskRepo repositories.TaskRepository, projectRepo repositories.ProjectRepository, userRepo repositories.UserRepository, cacheClient ...*cache.RedisClient) TaskService {
+	var c *cache.RedisClient
+	if len(cacheClient) > 0 && cacheClient[0] != nil {
+		c = cacheClient[0]
+	}
 	return &taskService{
 		taskRepo:    taskRepo,
 		projectRepo: projectRepo,
 		userRepo:    userRepo,
+		cache:       c,
+		cacheTTL:    15 * time.Minute,
 	}
 }
 
@@ -86,6 +97,8 @@ func (s *taskService) Create(ctx context.Context, userID uint, role string, req 
 		return nil, errors.NewInternalServerError("Failed to create task", err)
 	}
 
+	s.invalidateCache(ctx)
+
 	created, err := s.taskRepo.GetByID(ctx, task.ID)
 	if err != nil {
 		return toTaskResponse(task), nil
@@ -95,6 +108,14 @@ func (s *taskService) Create(ctx context.Context, userID uint, role string, req 
 }
 
 func (s *taskService) GetByID(ctx context.Context, id uint) (*dto.TaskResponse, *errors.AppError) {
+	cacheKey := fmt.Sprintf("task:detail:%d", id)
+	if s.cache != nil {
+		var cached dto.TaskResponse
+		if err := s.cache.Get(ctx, cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
+	}
+
 	task, err := s.taskRepo.GetByID(ctx, id)
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -102,7 +123,13 @@ func (s *taskService) GetByID(ctx context.Context, id uint) (*dto.TaskResponse, 
 		}
 		return nil, errors.NewInternalServerError("Failed to get task", err)
 	}
-	return toTaskResponse(task), nil
+
+	res := toTaskResponse(task)
+	if s.cache != nil && res != nil {
+		_ = s.cache.Set(ctx, cacheKey, res, s.cacheTTL)
+	}
+
+	return res, nil
 }
 
 func (s *taskService) Update(ctx context.Context, id uint, userID uint, role string, req *dto.UpdateTaskRequest) (*dto.TaskResponse, *errors.AppError) {
@@ -156,6 +183,8 @@ func (s *taskService) Update(ctx context.Context, id uint, userID uint, role str
 		return nil, errors.NewInternalServerError("Failed to update task", err)
 	}
 
+	s.invalidateCache(ctx)
+
 	updated, err := s.taskRepo.GetByID(ctx, id)
 	if err != nil {
 		return toTaskResponse(task), nil
@@ -183,6 +212,8 @@ func (s *taskService) PatchStatus(ctx context.Context, id uint, userID uint, rol
 		return nil, errors.NewInternalServerError("Failed to patch task status", err)
 	}
 
+	s.invalidateCache(ctx)
+
 	updated, err := s.taskRepo.GetByID(ctx, id)
 	if err != nil {
 		task.Status = status
@@ -209,7 +240,16 @@ func (s *taskService) Delete(ctx context.Context, id uint, userID uint, role str
 	if err := s.taskRepo.Delete(ctx, id); err != nil {
 		return errors.NewInternalServerError("Failed to delete task", err)
 	}
+
+	s.invalidateCache(ctx)
 	return nil
+}
+
+func (s *taskService) invalidateCache(ctx context.Context) {
+	if s.cache != nil {
+		_ = s.cache.DeleteByPattern(ctx, "task:*")
+		_ = s.cache.DeleteByPattern(ctx, "project:*")
+	}
 }
 
 func (s *taskService) List(ctx context.Context, pagination utils.PaginationQuery, filter dto.TaskFilterQuery) ([]dto.TaskResponse, int64, *errors.AppError) {

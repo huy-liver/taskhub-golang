@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"taskhub/internal/cache"
 	"taskhub/internal/configs"
 	"taskhub/internal/handlers"
 	"taskhub/internal/middlewares"
@@ -20,11 +21,16 @@ type Handlers struct {
 }
 
 // SetupRouter sets up Gin engine and registers all middleware and routes
-func SetupRouter(cfg *configs.Config, logger *zap.Logger, h *Handlers) *gin.Engine {
+func SetupRouter(cfg *configs.Config, logger *zap.Logger, h *Handlers, redisClient ...*cache.RedisClient) *gin.Engine {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	} else {
 		gin.SetMode(gin.DebugMode)
+	}
+
+	var rdb *cache.RedisClient
+	if len(redisClient) > 0 && redisClient[0] != nil {
+		rdb = redisClient[0]
 	}
 
 	r := gin.New()
@@ -45,9 +51,12 @@ func SetupRouter(cfg *configs.Config, logger *zap.Logger, h *Handlers) *gin.Engi
 	})
 
 	apiV1 := r.Group("/api/v1")
+	// Global API rate limit
+	apiV1.Use(middlewares.RateLimiter(rdb, cfg.RateLimitRequestsPerMinute, "global"))
 	{
-		// Public Auth routes
+		// Public Auth routes with stricter rate limit
 		authGroup := apiV1.Group("/auth")
+		authGroup.Use(middlewares.RateLimiter(rdb, cfg.RateLimitAuthRequestsPerMinute, "auth"))
 		{
 			authGroup.POST("/register", h.AuthHandler.Register)
 			authGroup.POST("/login", h.AuthHandler.Login)
